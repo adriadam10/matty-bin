@@ -1,0 +1,73 @@
+# Daily: bump PKGBUILD to Matty's newest release, build it, commit it here
+# and push it to the AUR. A push to main (a manual PKGBUILD change) is
+# built and published the same way.
+name: update
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install tools
+        run: pacman -Syu --noconfirm --needed git openssh jq
+
+      - uses: actions/checkout@v6
+
+      - name: Bump to the latest release
+        id: bump
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          useradd -m builder
+          chown -R builder .
+          su builder -c "GITHUB_OUTPUT=/tmp/bump GITHUB_TOKEN=$GITHUB_TOKEN scripts/update.sh --apply"
+          cat /tmp/bump >> "$GITHUB_OUTPUT"
+
+      - name: Build the package
+        run: |
+          pacman -S --noconfirm --needed $(sed -n 's/^\tdepends = //p' .SRCINFO)
+          su builder -c "makepkg --noconfirm --cleanbuild"
+          pacman -U --noconfirm matty-bin-*.pkg.tar.zst
+          matty --version || test -x /usr/bin/matty
+
+      - name: Commit the bump
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "build: matty $(sed -n 's/^_pkgver=//p' PKGBUILD)"
+          git push origin HEAD
+
+      - name: Push to the AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          install -dm700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur"
+          git clone ssh://aur@aur.archlinux.org/matty-bin.git /tmp/aur
+          cp PKGBUILD .SRCINFO /tmp/aur/
+          cd /tmp/aur
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then echo "AUR already up to date"; exit 0; fi
+          git -c user.name=adriadam10 -c user.email=adriadam10@gmail.com \
+            commit -m "Update to $(sed -n 's/^_pkgver=//p' PKGBUILD)"
+          git push origin HEAD:master
